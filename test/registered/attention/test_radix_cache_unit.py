@@ -647,5 +647,189 @@ class TestRadixCache(unittest.TestCase):
             self.assertEqual(len(node.hash_value), 1)
 
 
+class TestMultiTurnCacheHits(unittest.TestCase):
+    """Test cases for multi-turn conversation cache behavior.
+
+    This test class verifies that generated tokens from previous turns
+    are properly cached and can be matched in subsequent turns.
+
+    Regression test for: https://github.com/sgl-project/sglang/issues/XXXX
+    The bug was that cache_finished_req() used req.fill_ids (which is stale
+    at finish time) instead of the correctly computed token_ids that includes
+    generated tokens.
+    """
+
+    def setUp(self):
+        """Set up test fixtures with mock memory pools."""
+        TreeNode.counter = 0
+
+        # Create mock allocator
+        self.mock_allocator = unittest.mock.Mock()
+        self.mock_allocator.device = torch.device("cpu")
+
+        # Create mock req_to_token_pool
+        self.mock_req_to_token_pool = unittest.mock.Mock()
+        self.max_context_len = 1024
+        # Create a tensor that will be indexed into
+        self.req_to_token = torch.arange(
+            self.max_context_len, dtype=torch.int32, device="cpu"
+        )
+        self.mock_req_to_token_pool.req_to_token = self.req_to_token.unsqueeze(0)
+        self.mock_req_to_token_pool.free = unittest.mock.Mock()
+
+    def _create_mock_req(
+        self, origin_input_ids, output_ids, fill_ids, req_pool_idx=0
+    ):
+        """Create a mock request object with the necessary attributes."""
+        mock_req = unittest.mock.Mock()
+        mock_req.origin_input_ids = origin_input_ids
+        mock_req.output_ids = output_ids
+        mock_req.fill_ids = fill_ids  # Stale fill_ids (as set at scheduling time)
+        mock_req.req_pool_idx = req_pool_idx
+        mock_req.extra_key = None
+        mock_req.cache_protected_len = 0
+        mock_req.last_node = None
+
+        # Mock pop_committed_kv_cache to return the total length
+        total_len = len(origin_input_ids) + len(output_ids)
+        mock_req.pop_committed_kv_cache = unittest.mock.Mock(return_value=total_len)
+
+        return mock_req
+
+    def _create_cache_with_pools(self, page_size=1, is_eagle=False):
+        """Create a RadixCache with the mock memory pools."""
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=self.mock_req_to_token_pool,
+            token_to_kv_pool_allocator=self.mock_allocator,
+            page_size=page_size,
+            is_eagle=is_eagle,
+        )
+        return RadixCache(params)
+
+    def test_cache_finished_req_includes_generated_tokens(self):
+        """Test that cache_finished_req properly caches generated tokens.
+
+        Scenario:
+        - Turn 1: prompt = [1, 2, 3], generated = [4, 5]
+        - After turn 1 completes, the radix tree should contain [1, 2, 3, 4, 5]
+        - Turn 2: input = [1, 2, 3, 4, 5, 6, 7]
+        - Turn 2 should get a cache hit of at least 5 tokens (not just 3)
+
+        This test catches the bug where fill_ids (stale, containing only prompt)
+        was used instead of token_ids (correct, containing prompt + generated).
+        """
+        cache = self._create_cache_with_pools(page_size=1)
+
+        # Simulate Turn 1
+        origin_input_ids_t1 = [1, 2, 3]
+        output_ids_t1 = [4, 5]
+        # fill_ids is computed at scheduling time, before decoding
+        fill_ids_t1 = origin_input_ids_t1.copy()  # Stale: only prompt tokens
+
+        mock_req_t1 = self._create_mock_req(
+            origin_input_ids=origin_input_ids_t1,
+            output_ids=output_ids_t1,
+            fill_ids=fill_ids_t1,
+        )
+        # Set last_node to root for the test
+        mock_req_t1.last_node = cache.root_node
+
+        # Cache the finished request
+        cache.cache_finished_req(mock_req_t1, is_insert=True)
+
+        # Verify the cache now contains the full sequence (prompt + generated)
+        full_sequence_t1 = origin_input_ids_t1 + output_ids_t1  # [1, 2, 3, 4, 5]
+        result = cache.match_prefix(RadixKey(full_sequence_t1))
+
+        # The cache should contain all 5 tokens
+        self.assertEqual(
+            len(result.device_indices),
+            5,
+            f"Expected cache to contain 5 tokens (prompt + generated), "
+            f"but got {len(result.device_indices)}. "
+            f"This indicates the bug where only prompt tokens were cached.",
+        )
+
+    def test_multi_turn_cache_hit_includes_previous_generation(self):
+        """Test multi-turn scenario where turn 2 should hit tokens from turn 1.
+
+        Scenario:
+        - Turn 1: prompt = 10 tokens, generated = 5 tokens
+        - Turn 2: input = prompt(10) + prev_generated(5) + new_user(5) = 20 tokens
+
+        Expected: Turn 2 should get cache hit of ~15 tokens (prompt + prev_generated)
+        Bug behavior: Turn 2 only gets cache hit of ~10 tokens (just prompt)
+        """
+        cache = self._create_cache_with_pools(page_size=1)
+
+        # Turn 1
+        prompt_t1 = list(range(100, 110))  # 10 prompt tokens
+        generated_t1 = list(range(200, 205))  # 5 generated tokens
+        fill_ids_t1 = prompt_t1.copy()  # Stale fill_ids
+
+        mock_req_t1 = self._create_mock_req(
+            origin_input_ids=prompt_t1,
+            output_ids=generated_t1,
+            fill_ids=fill_ids_t1,
+        )
+        mock_req_t1.last_node = cache.root_node
+
+        # Cache turn 1
+        cache.cache_finished_req(mock_req_t1, is_insert=True)
+
+        # Turn 2 input: prompt + turn1_output + new_user_tokens
+        new_user_tokens = list(range(300, 305))  # 5 new tokens
+        turn2_input = prompt_t1 + generated_t1 + new_user_tokens
+
+        # Try to match prefix for turn 2
+        result = cache.match_prefix(RadixKey(turn2_input))
+
+        # We should get a cache hit of 15 tokens (prompt + generated from turn 1)
+        expected_cache_hit = len(prompt_t1) + len(generated_t1)  # 15
+
+        self.assertGreaterEqual(
+            len(result.device_indices),
+            expected_cache_hit,
+            f"Expected cache hit of at least {expected_cache_hit} tokens "
+            f"(prompt + previous generation), but only got {len(result.device_indices)}. "
+            f"This indicates previously generated tokens are not being cached.",
+        )
+
+    def test_cache_finished_req_with_page_alignment(self):
+        """Test that multi-turn caching works correctly with page_size > 1."""
+        cache = self._create_cache_with_pools(page_size=4)
+
+        # Use token counts that align with page size
+        prompt = list(range(100, 108))  # 8 tokens (2 pages)
+        generated = list(range(200, 204))  # 4 tokens (1 page)
+        fill_ids = prompt.copy()
+
+        mock_req = self._create_mock_req(
+            origin_input_ids=prompt,
+            output_ids=generated,
+            fill_ids=fill_ids,
+        )
+        mock_req.last_node = cache.root_node
+
+        cache.cache_finished_req(mock_req, is_insert=True)
+
+        # Full sequence should be cached (page-aligned: 12 tokens = 3 pages)
+        full_sequence = prompt + generated
+        result = cache.match_prefix(RadixKey(full_sequence))
+
+        # With page_size=4, we should get 12 tokens cached (all page-aligned)
+        expected_cached = 12
+        self.assertEqual(
+            len(result.device_indices),
+            expected_cached,
+            f"Expected {expected_cached} tokens to be cached with page_size=4, "
+            f"but got {len(result.device_indices)}.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
